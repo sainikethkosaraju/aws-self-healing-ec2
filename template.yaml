@@ -1,0 +1,336 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Self-healing EC2: CloudWatch status-check alarms drive native EC2 auto-recovery and
+  reboot, a Lambda remediator diagnoses and fixes runaway CPU, and SNS e-mails every
+  event. Optionally runs the workload in an Auto Scaling Group that replaces failed
+  instances.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Notifications }
+        Parameters: [AlertEmail]
+      - Label: { default: Compute }
+        Parameters: [DeploymentMode, InstanceType, LatestAmiId]
+      - Label: { default: Detection and remediation }
+        Parameters: [CpuThreshold, CpuEvaluationMinutes, RemediationCooldownMinutes, KillableProcesses]
+
+Parameters:
+  AlertEmail:
+    Type: String
+    Description: Address that receives alarm and remediation e-mails (confirm the SNS subscription after deploying).
+    AllowedPattern: "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$"
+  DeploymentMode:
+    Type: String
+    Default: single-instance
+    AllowedValues: [single-instance, auto-scaling-group]
+    Description: >-
+      single-instance = one EC2 instance healed in place (recover / reboot / remediate).
+      auto-scaling-group = one instance in an ASG that is replaced if it becomes unhealthy.
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t3.micro, t3.small, t3a.micro, t2.micro]
+    Description: Must be an EBS-backed type that supports EC2 auto-recovery.
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+  CpuThreshold:
+    Type: Number
+    Default: 90
+    MinValue: 1
+    MaxValue: 100
+    Description: Average CPU % that counts as a runaway workload.
+  CpuEvaluationMinutes:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 60
+    Description: Consecutive 1-minute periods above the threshold before the CPU alarm fires.
+  RemediationCooldownMinutes:
+    Type: Number
+    Default: 30
+    MinValue: 0
+    Description: Minimum time between automated remediations on the same instance (prevents reboot loops).
+  KillableProcesses:
+    Type: String
+    Default: "yes,stress-ng,stress-ng-cpu,stress"
+    Description: >-
+      Comma-separated process names the remediator may terminate instead of rebooting.
+      Anything else hogging the CPU triggers a reboot.
+
+Conditions:
+  IsSingleInstance: !Equals [!Ref DeploymentMode, single-instance]
+  IsAutoScaling: !Equals [!Ref DeploymentMode, auto-scaling-group]
+
+Resources:
+  # ------------------------------------------------------------------ alerts
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${AWS::StackName}-alerts"
+      DisplayName: Self-healing EC2
+
+  AlertSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # ------------------------------------------------------------------ instance
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/CloudWatchAgentServerPolicy"
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref InstanceRole]
+
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: No inbound rules; administer through SSM Session Manager. Default egress (all) reaches SSM, CloudWatch and package mirrors.
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile: { Arn: !GetAtt InstanceProfile.Arn }
+        SecurityGroupIds: [!GetAtt InstanceSecurityGroup.GroupId]
+        Monitoring: { Enabled: true }            # 1-minute metrics, as in the original build
+        MetadataOptions:
+          HttpTokens: required                    # IMDSv2 only
+          HttpEndpoint: enabled
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - { Key: Name, Value: !Sub "${AWS::StackName}-vm" }
+              - { Key: SelfHealing, Value: managed }
+        UserData:
+          Fn::Base64: |
+            #!/bin/bash
+            set -euo pipefail
+            dnf install -y amazon-cloudwatch-agent stress-ng python3
+            # memory and disk metrics (not collected by EC2 by default)
+            cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<'JSON'
+            {"metrics": {"namespace": "SelfHealingEC2",
+              "append_dimensions": {"InstanceId": "${aws:InstanceId}"},
+              "metrics_collected": {
+                "mem":  {"measurement": ["mem_used_percent"], "metrics_collection_interval": 60},
+                "disk": {"measurement": ["used_percent"], "resources": ["/"], "metrics_collection_interval": 60}}}}
+            JSON
+            /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s \
+              -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+            # a tiny workload so there is something to keep alive
+            mkdir -p /srv/www && echo "self-healing demo: $(hostname)" > /srv/www/index.html
+            cat > /etc/systemd/system/demo-web.service <<'UNIT'
+            [Unit]
+            Description=Demo web workload
+            After=network-online.target
+            [Service]
+            ExecStart=/usr/bin/python3 -m http.server 8080 --directory /srv/www
+            Restart=always
+            RestartSec=2
+            [Install]
+            WantedBy=multi-user.target
+            UNIT
+            systemctl daemon-reload && systemctl enable --now demo-web
+
+  Instance:
+    Type: AWS::EC2::Instance
+    Condition: IsSingleInstance
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Condition: IsAutoScaling
+    Properties:
+      MinSize: "1"
+      MaxSize: "1"
+      DesiredCapacity: "1"
+      AvailabilityZones: !GetAZs ""
+      HealthCheckType: EC2
+      HealthCheckGracePeriod: 180
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      NotificationConfigurations:
+        - TopicARN: !Ref AlertTopic
+          NotificationTypes:
+            - autoscaling:EC2_INSTANCE_LAUNCH
+            - autoscaling:EC2_INSTANCE_TERMINATE
+            - autoscaling:EC2_INSTANCE_LAUNCH_ERROR
+
+  # ------------------------------------------------------------------ level 1: native EC2 actions
+  SystemStatusAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsSingleInstance
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-system-status-check"
+      AlarmDescription: >-
+        AWS-side failure (host hardware, power, network). EC2 auto-recovery migrates the
+        instance to healthy hardware, keeping its ID, private IP, EBS volumes and metadata.
+      Namespace: AWS/EC2
+      MetricName: StatusCheckFailed_System
+      Dimensions: [{ Name: InstanceId, Value: !Ref Instance }]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: missing
+      AlarmActions:
+        - !Sub "arn:${AWS::Partition}:automate:${AWS::Region}:ec2:recover"
+        - !Ref AlertTopic
+      OKActions: [!Ref AlertTopic]
+
+  InstanceStatusAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsSingleInstance
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-instance-status-check"
+      AlarmDescription: >-
+        Guest-OS failure (kernel panic, exhausted memory, broken networking). A reboot is
+        the documented first response.
+      Namespace: AWS/EC2
+      MetricName: StatusCheckFailed_Instance
+      Dimensions: [{ Name: InstanceId, Value: !Ref Instance }]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: missing
+      AlarmActions:
+        - !Sub "arn:${AWS::Partition}:automate:${AWS::Region}:ec2:reboot"
+        - !Ref AlertTopic
+      OKActions: [!Ref AlertTopic]
+
+  # ------------------------------------------------------------------ level 2: diagnose-then-remediate
+  HighCpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-sustained-high-cpu"
+      AlarmDescription: >-
+        Sustained CPU saturation. Notifies, and an EventBridge rule hands the instance to the
+        remediation Lambda (diagnose with SSM, then kill the runaway process or reboot).
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Dimensions:
+        - !If
+          - IsSingleInstance
+          - { Name: InstanceId, Value: !Ref Instance }
+          - { Name: AutoScalingGroupName, Value: !Ref AutoScalingGroup }
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: !Ref CpuEvaluationMinutes
+      DatapointsToAlarm: !Ref CpuEvaluationMinutes
+      Threshold: !Ref CpuThreshold
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+      OKActions: [!Ref AlertTopic]
+
+  RemediationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: remediate-managed-instances-only
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadInventory
+                Effect: Allow
+                Action: [ec2:DescribeInstances, autoscaling:DescribeAutoScalingGroups, ssm:GetCommandInvocation]
+                Resource: "*"
+              - Sid: ActOnlyOnInstancesTaggedByThisStack
+                Effect: Allow
+                Action: [ec2:RebootInstances, ec2:CreateTags, ssm:SendCommand]
+                Resource: !Sub "arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*"
+                Condition:
+                  StringEquals: { "aws:ResourceTag/SelfHealing": managed }
+              - Sid: RunShellDocument
+                Effect: Allow
+                Action: ssm:SendCommand
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}::document/AWS-RunShellScript"
+              - Sid: Notify
+                Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref AlertTopic
+
+  RemediationFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn-lint: { config: { ignore_checks: [W3002] } }   # local code path is resolved by `aws cloudformation package`
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-remediator"
+      Description: Diagnose a high-CPU instance over SSM, then kill the runaway process or reboot.
+      Runtime: python3.12
+      Handler: remediator.handler
+      Code: lambda/          # packaged and uploaded by `aws cloudformation package` (see scripts/deploy.sh)
+      Timeout: 120
+      MemorySize: 128
+      Role: !GetAtt RemediationRole.Arn
+      Environment:
+        Variables:
+          TOPIC_ARN: !Ref AlertTopic
+          COOLDOWN_MINUTES: !Ref RemediationCooldownMinutes
+          KILLABLE_PROCESSES: !Ref KillableProcesses
+
+  HighCpuRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Route the high-CPU alarm entering ALARM to the remediation Lambda.
+      EventPattern:
+        source: [aws.cloudwatch]
+        detail-type: [CloudWatch Alarm State Change]
+        detail:
+          alarmName: [!Ref HighCpuAlarm]       # Ref of an alarm is its name
+          state: { value: [ALARM] }
+      Targets:
+        - Id: remediator
+          Arn: !GetAtt RemediationFunction.Arn
+
+  HighCpuRulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref RemediationFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt HighCpuRule.Arn
+
+Outputs:
+  AlertTopicArn:
+    Value: !Ref AlertTopic
+  InstanceId:
+    Condition: IsSingleInstance
+    Value: !Ref Instance
+  AutoScalingGroupName:
+    Condition: IsAutoScaling
+    Value: !Ref AutoScalingGroup
+  RemediationFunctionName:
+    Value: !Ref RemediationFunction

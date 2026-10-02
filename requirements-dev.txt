@@ -1,0 +1,5 @@
+cfn-lint>=1.0
+moto[ec2,sns,ssm,autoscaling]>=5.0
+boto3
+pyyaml
+pytest
